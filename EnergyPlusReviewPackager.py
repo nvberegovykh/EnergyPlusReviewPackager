@@ -9,24 +9,30 @@ from __future__ import annotations
 import os, queue, subprocess, tempfile, threading, sys
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
+from tkinter import font as tkfont
 
 # ---- generator (embedded, simplified import-less) ----
 import re, zipfile, html as _html
 from bs4 import BeautifulSoup
-from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, PageBreak, Flowable
+from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, PageBreak, Flowable, Preformatted
 from reportlab.lib.pagesizes import landscape, letter
 from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
 from reportlab.lib import colors
 from reportlab.lib.units import inch
 # Optional: end-use chart
 try:
-    from reportlab.graphics.shapes import Drawing
+    from reportlab.graphics.shapes import Drawing, String
     from reportlab.graphics.charts.piecharts import Pie
     from reportlab.graphics.charts.legends import Legend
+    from reportlab.graphics.charts.linecharts import HorizontalLineChart
+    from reportlab.graphics.charts.lineplots import LinePlot
     _HAS_GRAPHICS = True
 except ImportError:
     _HAS_GRAPHICS = False
     Legend = None  # type: ignore
+    HorizontalLineChart = None  # type: ignore
+    LinePlot = None  # type: ignore
+    String = None  # type: ignore
 
 # Modern theme colors (text on white must be dark)
 THEME = {
@@ -604,6 +610,467 @@ def extract_end_use_for_chart(soup):
     results.sort(key=lambda x: -x[1])
     return results[:12]
 
+def _extract_numeric_sequence(cells):
+    vals = []
+    for c in cells:
+        v = parse_number(c)
+        if v is not None:
+            vals.append(float(v))
+    return vals
+
+def _norm_sched_name(s: str) -> str:
+    s = norm(s or "").lower()
+    s = re.sub(r"[\[\]\(\)\{\}_\-]", " ", s)
+    s = re.sub(r"\s+", " ", s).strip()
+    return s
+
+def _model_field_token(line: str) -> str:
+    """Return cleaned first field token from an OSM/IDF object line."""
+    base = re.sub(r"!.*$", "", line or "").strip()
+    if not base:
+        return ""
+    base = base.split(",", 1)[0].strip()
+    base = base.rstrip(";").strip()
+    return norm(base)
+
+def extract_used_schedule_names(soup):
+    """Collect schedule names referenced in eplustbl schedule-name columns."""
+    out = set()
+    if not soup:
+        return out
+    for table in soup.find_all("table"):
+        data = table_to_matrix(table)
+        if len(data) < 2:
+            continue
+        hdr = data[0]
+        schedule_cols = [i for i, h in enumerate(hdr) if "schedule" in norm(h).lower()]
+        if not schedule_cols:
+            continue
+        for r in data[1:]:
+            for j in schedule_cols:
+                if j >= len(r):
+                    continue
+                v = norm(r[j])
+                if not v or v in ("-", "N/A", "NA"):
+                    continue
+                # exclude obvious non-name schedule flags
+                if v.lower() in ("yes", "no"):
+                    continue
+                if parse_number(v) is not None:
+                    continue
+                out.add(v)
+    return out
+
+def extract_used_schedule_refs_from_model(model_path: str):
+    """Collect schedule references from model objects (names and handles)."""
+    refs = {"names": set(), "handles": set()}
+    if not model_path or not os.path.isfile(model_path):
+        return refs
+    try:
+        txt = open(model_path, "r", encoding="utf-8", errors="ignore").read()
+    except Exception:
+        return refs
+    for blk in re.split(r"(?mi)^\s*(?=OS:)", txt or ""):
+        if not blk or not blk.strip():
+            continue
+        lines = [ln.rstrip() for ln in blk.splitlines() if ln.strip()]
+        if not lines:
+            continue
+        obj_type = norm(lines[0].split(",", 1)[0]).lower()
+        if obj_type.startswith("os:schedule:") or obj_type == "os:scheduletypelimits":
+            continue
+        for ln in lines[1:]:
+            low = ln.lower()
+            if "schedule" in low and "type limits" not in low:
+                token = _model_field_token(ln)
+                if not token or token in ("-", "N/A", "NA"):
+                    continue
+                if token.startswith("{") and token.endswith("}"):
+                    refs["handles"].add(token)
+                else:
+                    refs["names"].add(token)
+    return refs
+
+def _build_hourly_from_until_pairs(pairs):
+    """Convert [(until_minute, value), ...] to 24 hourly values."""
+    if not pairs:
+        return []
+    # EnergyPlus/OpenStudio "Value Until Time" means:
+    # value applies from previous break up to the end of the stated hour.
+    # Hour bins are 1..24 (not 0..23 starts), so 06:00 maps through hour 6.
+    vals = [0.0] * 24
+    clean = sorted(
+        [(max(0, min(1440, int(um))), float(v)) for (um, v) in pairs],
+        key=lambda x: x[0]
+    )
+    prev_um = 0
+    for um, value in clean:
+        if um <= prev_um:
+            prev_um = um
+            continue
+        start_hr = int(prev_um // 60) + 1
+        end_hr = int((um + 59) // 60)  # ceil to hour bin
+        start_hr = max(1, min(24, start_hr))
+        end_hr = max(1, min(24, end_hr))
+        for hr in range(start_hr, end_hr + 1):
+            vals[hr - 1] = value
+        prev_um = um
+    # If schedule does not explicitly reach 24:00, carry last value to end of day.
+    if clean and prev_um < 1440:
+        last_v = clean[-1][1]
+        start_hr = max(1, min(24, int(prev_um // 60) + 1))
+        for hr in range(start_hr, 25):
+            vals[hr - 1] = last_v
+    return vals
+
+def _convert_schedule_values_by_unit(vals, unit_type: str):
+    u = (unit_type or "").strip().lower()
+    if not vals:
+        return vals, "value"
+    if "temperature" in u:
+        return ([c_to_f(v) for v in vals], "F") if _USE_IMPERIAL else (vals, "C")
+    if "fraction" in u:
+        return vals, "fraction"
+    if "on/off" in u or "availability" in u:
+        return vals, "on/off"
+    if "control" in u:
+        return vals, "control"
+    return vals, (u if u else "value")
+
+def _extract_osm_schedule_profiles(model_text: str, used_schedule_names=None, used_schedule_handles=None, max_profiles=60, model_name="model.osm"):
+    """Parse OSM schedule objects and build 24h curves from OS:Schedule:Day."""
+    used_norm = {_norm_sched_name(x) for x in (used_schedule_names or set()) if norm(x)}
+    used_handles = set(used_schedule_handles or set())
+    day_by_handle = {}
+    day_by_name = {}
+    type_limits = {}  # handle -> unit type
+    rulesets = []  # [(ruleset_handle, ruleset_name, [day_handle,...])]
+    constants = []  # [(handle, name, type_limits_handle, value)]
+    blocks = re.split(r"(?mi)^\s*(?=OS:)", model_text or "")
+    for blk in blocks:
+        if not blk or not blk.strip():
+            continue
+        lines = [ln.rstrip() for ln in blk.splitlines() if ln.strip()]
+        if not lines:
+            continue
+        obj_type = norm(lines[0].split(",", 1)[0]).lower()
+        if obj_type == "os:scheduletypelimits":
+            h = ""
+            u = ""
+            for ln in lines[1:]:
+                token = _model_field_token(ln)
+                cm = ln.lower()
+                if "!- handle" in cm:
+                    h = token
+                elif "!- unit type" in cm:
+                    u = token
+            if h:
+                type_limits[h] = u
+        elif obj_type == "os:schedule:day":
+            handle = ""
+            name = ""
+            pairs = []
+            cur_h = None
+            cur_m = None
+            for ln in lines[1:]:
+                token = _model_field_token(ln)
+                cm = ln.lower()
+                if "!- handle" in cm:
+                    handle = token
+                elif "!- name" in cm:
+                    name = token
+                elif "!- hour " in cm:
+                    v = parse_number(token)
+                    cur_h = int(v) if v is not None else None
+                elif "!- minute " in cm:
+                    v = parse_number(token)
+                    cur_m = int(v) if v is not None else None
+                elif "!- value until time " in cm:
+                    v = parse_number(token)
+                    if v is not None and cur_h is not None and cur_m is not None:
+                        pairs.append((cur_h * 60 + cur_m, float(v)))
+            vals = _build_hourly_from_until_pairs(pairs)
+            if name and len(vals) == 24:
+                if handle:
+                    day_by_handle[handle] = (name, vals)
+                day_by_name[_norm_sched_name(name)] = (name, vals)
+        elif obj_type == "os:schedule:ruleset":
+            rs_handle = ""
+            rs_name = ""
+            rs_type_handle = ""
+            default_day_ref = ""
+            other_day_refs = []
+            for ln in lines[1:]:
+                token = _model_field_token(ln)
+                cm = ln.lower()
+                if "!- handle" in cm:
+                    rs_handle = token
+                elif "!- name" in cm:
+                    rs_name = token
+                elif "schedule type limits name" in cm:
+                    rs_type_handle = token
+                elif ("schedule day name" in cm or "day schedule name" in cm) and token:
+                    if "default day schedule name" in cm:
+                        default_day_ref = token
+                    else:
+                        other_day_refs.append(token)
+            # "During the day" charts should represent the default daily profile.
+            day_refs = [default_day_ref] if default_day_ref else other_day_refs[:1]
+            if rs_name:
+                rulesets.append((rs_handle, rs_name, rs_type_handle, day_refs))
+        elif obj_type == "os:schedule:constant":
+            ch = ""
+            cn = ""
+            ct = ""
+            cv = None
+            for ln in lines[1:]:
+                token = _model_field_token(ln)
+                cm = ln.lower()
+                if "!- handle" in cm:
+                    ch = token
+                elif "!- name" in cm:
+                    cn = token
+                elif "schedule type limits name" in cm:
+                    ct = token
+                elif "!- value" in cm:
+                    cv = parse_number(token)
+            if cn and cv is not None:
+                constants.append((ch, cn, ct, float(cv)))
+
+    out = []
+    seen = set()
+    for rs_handle, rs_name, rs_type_handle, day_refs in rulesets:
+        rs_norm = _norm_sched_name(rs_name)
+        if used_norm or used_handles:
+            refs_norm = {_norm_sched_name(x) for x in day_refs if x}
+            refs_handle = set(day_refs)
+            if rs_norm not in used_norm and rs_handle not in used_handles and not (refs_norm & used_norm) and not (refs_handle & used_handles):
+                continue
+        unit_type = type_limits.get(rs_type_handle, "")
+        added_any = False
+        for ref in day_refs:
+            day = day_by_handle.get(ref)
+            if not day:
+                day = day_by_name.get(_norm_sched_name(ref))
+            if not day:
+                continue
+            dname, vals = day
+            dnorm = _norm_sched_name(dname)
+            if (
+                re.match(r"^schedule day\s*\d+$", dnorm, flags=re.I)
+                or dnorm.startswith(rs_norm)
+                or "default" in dnorm
+            ):
+                profile_name = rs_name
+            else:
+                profile_name = f"{rs_name} - {dname}"
+            vals2, unit_lbl = _convert_schedule_values_by_unit(vals, unit_type)
+            key = (rs_norm, tuple(round(v, 6) for v in vals2))
+            if key in seen:
+                continue
+            seen.add(key)
+            out.append({
+                "name": profile_name,
+                "vals": vals2,
+                "xlabels": [str(i) for i in range(1, 25)],
+                "source": f"OS:Schedule:Ruleset ({os.path.basename(model_name)})",
+                "unit": unit_lbl,
+            })
+            added_any = True
+            if max_profiles and len(out) >= max_profiles:
+                return out
+        # fallback: if ruleset matched but no day refs resolved, skip silently
+        _ = added_any
+
+    # Include used constant schedules (many "always on"/set constants live here).
+    for ch, cn, ct, cv in constants:
+        cn_norm = _norm_sched_name(cn)
+        if used_norm or used_handles:
+            if cn_norm not in used_norm and ch not in used_handles:
+                continue
+        vals = [cv] * 24
+        vals2, unit_lbl = _convert_schedule_values_by_unit(vals, type_limits.get(ct, ""))
+        key = (cn_norm, tuple(round(v, 6) for v in vals2))
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append({
+            "name": cn,
+            "vals": vals2,
+            "xlabels": [str(i) for i in range(1, 25)],
+            "source": f"OS:Schedule:Constant ({os.path.basename(model_name)})",
+            "unit": unit_lbl,
+        })
+        if max_profiles and len(out) >= max_profiles:
+            return out
+    # Conservative fallback: only include day schedules that directly match used schedule names.
+    if not out and day_by_handle and used_norm:
+        day_items = list(day_by_handle.values())
+        matched = [(n, v) for (n, v) in day_items if (used_norm and _norm_sched_name(n) in used_norm)]
+        for dname, vals in matched:
+            key = (_norm_sched_name(dname), tuple(round(v, 6) for v in vals))
+            if key in seen:
+                continue
+            seen.add(key)
+            out.append({
+                "name": dname,
+                "vals": vals,
+                "xlabels": [str(i) for i in range(1, 25)],
+                "source": f"OS:Schedule:Day ({os.path.basename(model_name)})",
+            })
+            if max_profiles and len(out) >= max_profiles:
+                break
+    return out
+
+def extract_model_schedule_profiles(model_path: str, used_schedule_names=None, used_schedule_handles=None, max_profiles=24):
+    """Extract day schedule curves from model text (.idf/.osm/other text-like) using Until: HH:MM, value pairs."""
+    if not model_path or not os.path.isfile(model_path):
+        return []
+    try:
+        txt = open(model_path, "r", encoding="utf-8", errors="ignore").read()
+    except Exception:
+        return []
+    if model_path.lower().endswith(".osm"):
+        osm_profiles = _extract_osm_schedule_profiles(
+            txt, used_schedule_names=used_schedule_names, used_schedule_handles=used_schedule_handles, max_profiles=max_profiles, model_name=model_path
+        )
+        if osm_profiles:
+            return osm_profiles
+    used_norm = {_norm_sched_name(x) for x in (used_schedule_names or set()) if norm(x)}
+    blocks = txt.split(";")
+    out = []
+    seen = set()
+    for b in blocks:
+        blo = b.lower()
+        if "until:" not in blo:
+            continue
+        # best-effort object + name extraction
+        lines = [re.sub(r"!.*$", "", x).strip() for x in b.splitlines()]
+        lines = [x for x in lines if x]
+        if not lines:
+            continue
+        head = lines[0]
+        # gather comma-separated cleaned tokens
+        tokens = []
+        for ln in lines:
+            parts = [norm(p) for p in ln.split(",")]
+            tokens.extend([p for p in parts if p])
+        if len(tokens) < 2:
+            continue
+        obj_type = tokens[0]
+        sched_name = tokens[1]
+        if used_norm and _norm_sched_name(sched_name) not in used_norm:
+            # if used names were provided, keep only referenced schedules
+            continue
+        pairs = []
+        for m in re.finditer(r"Until:\s*([0-2]?\d):([0-5]\d)\s*,\s*([-+]?\d+(?:\.\d+)?)", b, flags=re.I):
+            hh = int(m.group(1)); mm = int(m.group(2)); vv = float(m.group(3))
+            pairs.append((hh * 60 + mm, vv))
+        if len(pairs) < 2:
+            continue
+        vals = _build_hourly_from_until_pairs(pairs)
+        if len(vals) != 24:
+            continue
+        key = (_norm_sched_name(sched_name), tuple(round(v, 6) for v in vals))
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append({
+            "name": sched_name,
+            "vals": vals,
+            "xlabels": [str(i) for i in range(1, 25)],
+            "source": f"{obj_type} ({os.path.basename(model_path)})",
+        })
+        if max_profiles and len(out) >= max_profiles:
+            break
+    return out
+
+def extract_schedule_profiles(soup, max_profiles=12):
+    """Extract chartable schedule series from schedule-anchor tables in eplustbl."""
+    if not soup:
+        return []
+    candidates = []
+    seen = set()
+    for table in soup.find_all("table"):
+        title = ""
+        prev = table.previous_sibling
+        steps = 0
+        while prev and steps < 80:
+            steps += 1
+            if getattr(prev, "name", None) == "b":
+                t = norm(prev.get_text(" ", strip=True))
+                if t:
+                    title = t
+                    break
+            prev = prev.previous_sibling
+        tlo = (title or "").lower()
+        ctx = (title + " " + norm(table.get_text(" ", strip=True))[:500]).lower()
+        # Anchor on explicit schedule tables / references (avoids unrelated huge tables).
+        if not (
+            "schedules-" in tlo
+            or "thermostat schedules" in tlo
+            or "schedule type" in tlo
+            or ("schedule" in tlo and ("setpoint" in tlo or "equivalent" in tlo or "full load" in tlo))
+            or ("schedule" in ctx and "first object used" in ctx)
+        ):
+            continue
+        data = table_to_matrix(table)
+        if len(data) < 2:
+            continue
+        hdr = data[0]
+        idx_name = get_col_index(hdr, ["first object used", "schedule", "name", "profile", "day schedule", "thermostat"])
+        if idx_name < 0:
+            idx_name = 0
+        # candidate numeric columns by header text (avoid mixed-unit noise like "days with same").
+        num_cols = []
+        for j, h in enumerate(hdr):
+            if j == idx_name:
+                continue
+            hlo = norm(h).lower()
+            if not hlo:
+                continue
+            if "days with same" in hlo:
+                continue
+            if any(k in hlo for k in ("[c]", "[f]", "setpoint", "temperature", "hours", "equivalent", "11am", "11pm")):
+                num_cols.append(j)
+        if not num_cols:
+            # fallback: try any numeric columns in row later
+            num_cols = [j for j in range(len(hdr)) if j != idx_name]
+        for r in data[1:]:
+            if not r:
+                continue
+            name = norm(r[idx_name] if idx_name < len(r) else "")
+            if not name:
+                continue
+            # Add descriptor when available (e.g., Month Assumed) to avoid same-name ambiguity.
+            descriptor = ""
+            idx_desc = get_col_index(hdr, ["month assumed", "control type name", "control type"])
+            if idx_desc >= 0 and idx_desc < len(r):
+                d = norm(r[idx_desc])
+                if d and d != name and parse_number(d) is None:
+                    descriptor = d
+            vals = []
+            labels = []
+            for j in num_cols:
+                if j >= len(r):
+                    continue
+                v = parse_number(r[j])
+                if v is None:
+                    continue
+                vals.append(float(v))
+                labels.append(norm(hdr[j]) if j < len(hdr) else f"v{j}")
+            if len(vals) < 2:
+                continue
+            disp_name = f"{name} ({descriptor})" if descriptor else name
+            key = ((title or "").lower(), disp_name.lower(), tuple(round(v, 5) for v in vals))
+            if key in seen:
+                continue
+            seen.add(key)
+            candidates.append({"name": disp_name, "vals": vals, "xlabels": labels, "source": title or "Schedules"})
+            if max_profiles is not None and len(candidates) >= max_profiles:
+                return candidates
+    return candidates
+
 def extract_end_uses_fuel_gj(soup):
     """Return annual purchased energy by fuel from End Uses table, in GJ."""
     matrices = _end_uses_table_matrices(soup)
@@ -808,6 +1275,91 @@ def _draw_end_use_chart(data, width=4*inch, height=3*inch):
         ]
         drawing.add(legend)
     return _DrawingFlowable(drawing)
+
+def _draw_schedule_chart(profile, width=4.4*inch, height=2.2*inch):
+    """Draw one schedule profile chart with coordinate axes and grid."""
+    if not _HAS_GRAPHICS or not profile:
+        return None
+    vals = profile.get("vals") if isinstance(profile, dict) else None
+    xlabels = profile.get("xlabels") if isinstance(profile, dict) else None
+    unit = profile.get("unit", "value") if isinstance(profile, dict) else "value"
+    if not vals:
+        return None
+    d = Drawing(width, height)
+    vmin = min(vals)
+    vmax = max(vals)
+    if abs(vmax - vmin) < 1e-6:
+        vmax = vmin + 1.0
+    pad = (vmax - vmin) * 0.12
+    # Prefer step-style plot (no implied interpolation ramps between hour bins).
+    if LinePlot is not None and len(vals) >= 2:
+        lp = LinePlot()
+        lp.x = 38
+        lp.y = 26
+        lp.width = max(120, width - 66)
+        lp.height = max(90, height - 54)
+        pts = [(1, vals[0])]
+        for h in range(1, len(vals)):
+            x = h + 1
+            pts.append((x, vals[h - 1]))  # horizontal segment end
+            pts.append((x, vals[h]))      # vertical step
+        lp.data = [pts]
+        lp.lines[0].strokeColor = colors.HexColor("#22d3ee")
+        lp.lines[0].strokeWidth = 1.8
+        lp.joinedLines = 1
+        lp.xValueAxis.valueMin = 1
+        lp.xValueAxis.valueMax = max(24, len(vals))
+        lp.xValueAxis.valueStep = 1
+        lp.xValueAxis.labels.fontName = "Helvetica"
+        lp.xValueAxis.labels.fontSize = 6
+        lp.yValueAxis.valueMin = vmin - pad
+        lp.yValueAxis.valueMax = vmax + pad
+        lp.yValueAxis.labels.fontName = "Helvetica"
+        lp.yValueAxis.labels.fontSize = 6
+        lp.yValueAxis.visibleGrid = 1
+        lp.yValueAxis.gridStrokeColor = colors.HexColor("#334155")
+        lp.yValueAxis.gridStrokeWidth = 0.3
+        d.add(lp)
+        axis_x = lp.x
+        axis_y = lp.y
+        axis_w = lp.width
+        axis_h = lp.height
+    else:
+        if HorizontalLineChart is None:
+            return None
+        lc = HorizontalLineChart()
+        lc.x = 38
+        lc.y = 26
+        lc.width = max(120, width - 66)
+        lc.height = max(90, height - 54)
+        lc.data = [vals]
+        lc.joinedLines = 1
+        lc.lines[0].strokeColor = colors.HexColor("#22d3ee")
+        lc.lines[0].strokeWidth = 1.8
+        if xlabels and len(xlabels) == len(vals):
+            lc.categoryAxis.categoryNames = [norm(x)[:12] for x in xlabels]
+        else:
+            lc.categoryAxis.categoryNames = [str(i) for i in range(1, len(vals) + 1)]
+        lc.categoryAxis.labels.boxAnchor = "n"
+        lc.categoryAxis.labels.fontName = "Helvetica"
+        lc.categoryAxis.labels.fontSize = 6
+        lc.valueAxis.labels.fontName = "Helvetica"
+        lc.valueAxis.labels.fontSize = 6
+        lc.valueAxis.visibleGrid = 1
+        lc.valueAxis.gridStrokeColor = colors.HexColor("#334155")
+        lc.valueAxis.gridStrokeWidth = 0.3
+        lc.valueAxis.valueMin = vmin - pad
+        lc.valueAxis.valueMax = vmax + pad
+        d.add(lc)
+        axis_x = lc.x
+        axis_y = lc.y
+        axis_w = lc.width
+        axis_h = lc.height
+    if String is not None:
+        d.add(String(axis_x + axis_w - 8, 8, "Hour [hr]", fontName="Helvetica", fontSize=7, textAnchor="end"))
+        # Keep Y-axis label away from top tick labels to avoid visual overlap.
+        d.add(String(2, axis_y + axis_h + 4, f"Y [{unit}]", fontName="Helvetica", fontSize=7))
+    return _DrawingFlowable(d)
 
 def get_col_index(header_row, col_names):
     """Return column index for first matching header substring (case-insensitive)."""
@@ -2488,7 +3040,7 @@ def add_cover(flow, project_title, model_label, soup, H1,H2,NOTE,BODY):
     ))
     flow.append(PageBreak())
 
-def add_top_summary_annual(flow, soup, H2, H3, NOTE, usable_w, header_cell, body_cell):
+def add_top_summary_annual(flow, soup, H2, H3, NOTE, usable_w, header_cell, body_cell, schedule_profiles=None):
     flow.append(Paragraph("Annual Summary", H2))
     flow.append(Paragraph(f"All units in {_units_note()}.", NOTE))
     en1_end_use = build_en1_end_use_summary_table(soup)
@@ -2523,6 +3075,20 @@ def add_top_summary_annual(flow, soup, H2, H3, NOTE, usable_w, header_cell, body
             flow.append(Paragraph(f"End Use Distribution ({unit_label})", H3))
             flow.append(chart)
             flow.append(Spacer(1, 0.15*inch))
+    schedules = schedule_profiles if schedule_profiles is not None else extract_schedule_profiles(soup, max_profiles=12)
+    if schedules:
+        flow.append(Paragraph("Schedule Profiles (Daily)", H3))
+        flow.append(Paragraph("Hourly schedule curves (0-24h).", NOTE))
+        for profile in schedules:
+            sch_chart = _draw_schedule_chart(profile, width=min(usable_w * 0.72, 6.9*inch), height=2.4*inch)
+            if sch_chart:
+                flow.append(sch_chart)
+                # Name under each chart as requested
+                src = _html.escape(profile.get("source", "Schedules"))
+                nm = _html.escape(profile.get("name", "Schedule"))
+                flow.append(Paragraph(f"<b>{nm}</b> <font color='#64748b'>(from {src})</font>", NOTE))
+                flow.append(Spacer(1, 0.08*inch))
+        flow.append(Spacer(1, 0.08*inch))
     targets = [
         ("Annual Building Utility Performance Summary", ["annual building utility", "utility performance", "site and source energy", "end uses"]),
         ("End Uses", ["end uses"]),
@@ -2890,7 +3456,7 @@ def _section_pages_to_ranges(section_pages: list, total_pages: int) -> dict:
         out[cat] = ranges
     return out
 
-def build_pdf_all_tables(soup, out_path, project_title, label):
+def build_pdf_all_tables(soup, out_path, project_title, label, schedule_profiles=None):
     """Build full reports PDF. Returns (out_path, section_ranges) for Document Index."""
     H1,H2,H3,NOTE,BODY,HEADER_CELL,BODY_CELL = make_styles()
     doc = doc_template(out_path)
@@ -2901,7 +3467,7 @@ def build_pdf_all_tables(soup, out_path, project_title, label):
 
     add_cover(flow, project_title, f"{label} – Full Tabular Reports", soup, H1,H2,NOTE,BODY)
     flow.append(_SectionMarker("__start__", section_pages))
-    add_top_summary_annual(flow, soup, H2,H3,NOTE, usable_w, HEADER_CELL, BODY_CELL)
+    add_top_summary_annual(flow, soup, H2,H3,NOTE, usable_w, HEADER_CELL, BODY_CELL, schedule_profiles=schedule_profiles)
 
     for tag in soup.body.find_all(["p","b","table"], recursive=True):
         if tag.name == "p":
@@ -3068,7 +3634,21 @@ def build_pdf_document_index(out_path: str, project_title: str,
     flow.append(tbl)
     doc.build(flow)
 
-def generate_package(baseline_html: str, proposed_html: str, outdir: str, project_override: str="", use_imperial: bool = True, progress_callback=None, standard_version: str = "") -> str:
+def build_modeling_notes_pdf(out_path: str, project_title: str, notes_text: str) -> None:
+    """Build optional Modeling Notes PDF from user-entered text."""
+    H1, H2, _, NOTE = make_styles()[:4]
+    doc = SimpleDocTemplate(out_path, pagesize=letter, leftMargin=0.6*inch, rightMargin=0.6*inch,
+                            topMargin=0.6*inch, bottomMargin=0.6*inch)
+    flow = []
+    flow.append(Paragraph("Modeling Notes", H1))
+    flow.append(Paragraph(project_title, H2))
+    flow.append(Paragraph("User-provided assumptions, formulas, and notes.", NOTE))
+    flow.append(Spacer(1, 0.2*inch))
+    body = ParagraphStyle("NotesBody", parent=getSampleStyleSheet()["BodyText"], fontName="Courier", fontSize=9, leading=12)
+    flow.append(Preformatted((notes_text or "").replace("\r\n", "\n"), body))
+    doc.build(flow)
+
+def generate_package(baseline_html: str, proposed_html: str, outdir: str, project_override: str="", use_imperial: bool = True, progress_callback=None, standard_version: str = "", modeling_notes: str = "", baseline_model_file: str = "", proposed_model_file: str = "") -> str:
     def prog(pct: int, msg: str):
         if progress_callback:
             progress_callback(pct, msg)
@@ -3079,6 +3659,21 @@ def generate_package(baseline_html: str, proposed_html: str, outdir: str, projec
     prog(2, "Parsing HTML…")
     base_soup = load_soup(baseline_html)
     prop_soup = load_soup(proposed_html)
+    # If model files are provided, schedule extraction is model-driven only.
+    base_sched_names = set() if baseline_model_file else extract_used_schedule_names(base_soup)
+    prop_sched_names = set() if proposed_model_file else extract_used_schedule_names(prop_soup)
+    base_refs = extract_used_schedule_refs_from_model(baseline_model_file) if baseline_model_file else {"names": set(), "handles": set()}
+    prop_refs = extract_used_schedule_refs_from_model(proposed_model_file) if proposed_model_file else {"names": set(), "handles": set()}
+    base_used_names = set(base_sched_names) | set(base_refs.get("names", set()))
+    prop_used_names = set(prop_sched_names) | set(prop_refs.get("names", set()))
+    base_model_profiles = extract_model_schedule_profiles(
+        baseline_model_file, used_schedule_names=base_used_names,
+        used_schedule_handles=base_refs.get("handles", set()), max_profiles=120
+    ) if baseline_model_file else None
+    prop_model_profiles = extract_model_schedule_profiles(
+        proposed_model_file, used_schedule_names=prop_used_names,
+        used_schedule_handles=prop_refs.get("handles", set()), max_profiles=120
+    ) if proposed_model_file else None
     project = project_override.strip() or extract_project_name(prop_soup) or extract_project_name(base_soup)
     project_title = f"{project} – Energy Modeling Review Package (EnergyPlus PRM)"
 
@@ -3092,12 +3687,13 @@ def generate_package(baseline_html: str, proposed_html: str, outdir: str, projec
     f_windows = os.path.join(outdir, f"{project} - Envelope Performance_Windows.pdf")
     f_int = os.path.join(outdir, f"{project} - Interior Lighting Calculations.pdf")
     f_ext = os.path.join(outdir, f"{project} - Exterior Lighting Calculations.pdf")
+    f_notes = os.path.join(outdir, f"{project} - Modeling Notes.pdf")
 
     baseline_subtitle = f"BASELINE ({standard_version} Appendix G PRM)" if standard_version else "BASELINE (Appendix G PRM)"
     proposed_subtitle = f"PROPOSED DESIGN ({standard_version} Appendix G PRM)" if standard_version else "PROPOSED DESIGN (Appendix G PRM)"
-    _, baseline_ranges = build_pdf_all_tables(base_soup, f_base_reports, project_title, baseline_subtitle)
+    _, baseline_ranges = build_pdf_all_tables(base_soup, f_base_reports, project_title, baseline_subtitle, schedule_profiles=base_model_profiles)
     prog(15, "Building Proposed Reports…")
-    _, proposed_ranges = build_pdf_all_tables(prop_soup, f_prop_reports, project_title, proposed_subtitle)
+    _, proposed_ranges = build_pdf_all_tables(prop_soup, f_prop_reports, project_title, proposed_subtitle, schedule_profiles=prop_model_profiles)
 
     prog(25, "Building Baseline HVAC…")
     hvac_groups = [
@@ -3133,8 +3729,15 @@ def generate_package(baseline_html: str, proposed_html: str, outdir: str, projec
     build_pdf_document_index(f_doc_index, project_title,
                              f_base_reports, baseline_ranges, f_prop_reports, proposed_ranges)
 
+    notes_clean = (modeling_notes or "").strip()
+    if notes_clean:
+        prog(82, "Building Modeling Notes…")
+        build_modeling_notes_pdf(f_notes, project_title, notes_clean)
+
     zip_path = os.path.join(outdir, f"{project}_ReviewPackage.zip")
     zip_files = [f_doc_index, f_base_reports, f_prop_reports, f_base_hvac, f_prop_hvac, f_envelope, f_windows, f_int, f_ext]
+    if notes_clean and os.path.isfile(f_notes):
+        zip_files.append(f_notes)
     prog(85, "Creating ZIP…")
     with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED) as z:
         for i, f in enumerate(zip_files):
@@ -3145,6 +3748,7 @@ def generate_package(baseline_html: str, proposed_html: str, outdir: str, projec
 
 # ---- GUI ----
 _tkinterdnd = None
+_ctk = None
 
 def _ensure_tkinterdnd():
     global _tkinterdnd
@@ -3169,33 +3773,100 @@ def _ensure_tkinterdnd():
     except Exception:
         return False
 
+def _ensure_customtkinter():
+    global _ctk
+    try:
+        import customtkinter as ctk
+        _ctk = ctk
+        return True
+    except Exception:
+        pass
+    for cmd in [[sys.executable, "-m", "pip", "install", "customtkinter"], ["py", "-m", "pip", "install", "customtkinter"]]:
+        try:
+            subprocess.run(cmd, capture_output=True, timeout=120, check=True)
+            break
+        except Exception:
+            continue
+    try:
+        import customtkinter as ctk
+        _ctk = ctk
+        return True
+    except Exception:
+        _ctk = None
+        return False
+
 _ensure_tkinterdnd()
+_ensure_customtkinter()
+
+def _set_windows_app_user_model_id():
+    if sys.platform != "win32":
+        return
+    try:
+        import ctypes
+        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(
+            "LIBER.EnergyPlusReviewPackager"
+        )
+    except Exception:
+        pass
 
 class App(tk.Tk if _tkinterdnd is None else _tkinterdnd[1].Tk):
     def __init__(self):
         super().__init__()
         self.title("EnergyPlus → ZIP of PDF Reports")
         self._apply_app_icon()
-        self.geometry("820x520")
-        self.resizable(False, False)
+        self._setup_theme_and_fonts()
+        self._use_ctk = _ctk is not None
+        screen_w = max(1200, int(self.winfo_screenwidth()))
+        screen_h = max(800, int(self.winfo_screenheight()))
+        init_w = min(1180, int(screen_w * 0.72))
+        init_h = min(900, int(screen_h * 0.84))
+        self.geometry(f"{init_w}x{init_h}")
+        self.minsize(860, 640)
+        self.resizable(True, True)
+        self.configure(bg=self._colors["bg"])
+        try:
+            self.attributes("-alpha", 0.0)
+        except Exception:
+            pass
+        self.after(10, self._apply_window_corner_preference)
 
         self.baseline_path = tk.StringVar()
         self.proposed_path = tk.StringVar()
+        self.baseline_model_path = tk.StringVar()
+        self.proposed_model_path = tk.StringVar()
         self.project_name = tk.StringVar()
         self.status = tk.StringVar(value="Choose baseline + proposed eplustbl.html and click Generate.")
+        self.header_text = "EnergyPlus eplustbl.html -> ZIP of reviewer-friendly PDFs"
+        self.header_var = tk.StringVar(value="")
         self.out_zip = None
 
-        main = ttk.Frame(self, padding=16)
+        main = ttk.Frame(self, padding=18, style="Card.TFrame")
         main.pack(fill="both", expand=True)
 
-        ttk.Label(main, text="EnergyPlus eplustbl.html → ZIP of reviewer-friendly PDFs", font=("Segoe UI", 12, "bold")).pack(anchor="w")
+        title_row = ttk.Frame(main, style="Card.TFrame")
+        title_row.pack(fill="x")
+        self.title_label = tk.Label(
+            title_row, textvariable=self.header_var, bg=self._colors["panel"], fg=self._colors["text"],
+            font=self.font_title, anchor="w"
+        )
+        self.title_label.pack(side="left", anchor="w")
+        self.help_btn = tk.Button(
+            title_row, text="?", command=self._show_quick_help,
+            bg=self._colors["button"], fg=self._colors["text"], activebackground=self._colors["button_hover"],
+            activeforeground=self._colors["text"], relief="flat", bd=0, padx=9, pady=2,
+            cursor="hand2", font=(self.font_title[0], 10, "bold")
+        )
+        self.help_btn.pack(side="right")
 
-        info = ("Creates PDFs by category (Annual, HVAC, Envelope, Lighting) with Summary at the top of each.\n"
-                f"Document Index for EN-1 references. All units in {_units_note()}.")
-        ttk.Label(main, text=info).pack(anchor="w", pady=(6,14))
+        info = f"Creates PDFs by category (Annual, HVAC, Envelope, Lighting) with Summary at the top of each."
+        self.info_label = tk.Label(
+            main, text=info, bg=self._colors["panel"], fg=self._colors["muted"],
+            font=self.font_body, justify="left", anchor="w"
+        )
+        self.info_label.pack(anchor="w", pady=(6, 14))
 
-        grid = ttk.Frame(main)
-        grid.pack(fill="x")
+        grid = ttk.Frame(main, style="Card.TFrame")
+        grid.pack(fill="both", expand=True)
 
         def _parse_dropped_paths(data):
             """Parse Windows drag-drop data: {C:\\path} or {a} {b} -> list of paths."""
@@ -3217,16 +3888,30 @@ class App(tk.Tk if _tkinterdnd is None else _tkinterdnd[1].Tk):
             return [p for p in paths if p and os.path.isfile(p)]
 
         def row(label, var, cmd):
-            r = ttk.Frame(grid)
-            r.pack(fill="x", pady=6)
+            r = ttk.Frame(grid, style="Card.TFrame")
+            r.pack(fill="x", pady=4)
             lbl = label + (" (or drop)" if _tkinterdnd else "")
-            ttk.Label(r, text=lbl, width=20).pack(side="left")
-            ttk.Entry(r, textvariable=var).pack(side="left", fill="x", expand=True, padx=(0,8))
-            ttk.Button(r, text="Browse…", command=cmd, width=12).pack(side="left")
+            ttk.Label(r, text=lbl, width=28, anchor="w", style="Muted.TLabel").pack(side="left")
+            if self._use_ctk:
+                _ctk.CTkEntry(
+                    r, textvariable=var, corner_radius=12, height=30,
+                    fg_color=self._colors["input"], border_color=self._colors["border"],
+                    text_color=self._colors["text"]
+                ).pack(side="left", fill="x", expand=True, padx=(0, 8))
+                _ctk.CTkButton(
+                    r, text="Browse...", command=cmd, corner_radius=12, height=30, width=96,
+                    fg_color=self._colors["button"], hover_color=self._colors["button_hover"],
+                    text_color=self._colors["text"]
+                ).pack(side="left")
+            else:
+                ttk.Entry(r, textvariable=var, style="Dark.TEntry").pack(side="left", fill="x", expand=True, padx=(0,8))
+                ttk.Button(r, text="Browse...", command=cmd, width=12, style="Secondary.TButton").pack(side="left")
             return r
 
         r1 = row("Baseline HTML", self.baseline_path, self.pick_baseline)
         r2 = row("Proposed HTML", self.proposed_path, self.pick_proposed)
+        r1m = row("Baseline model (opt.)", self.baseline_model_path, self.pick_baseline_model)
+        r2m = row("Proposed model (opt.)", self.proposed_model_path, self.pick_proposed_model)
 
         if _tkinterdnd:
             DND_FILES, _ = _tkinterdnd
@@ -3242,65 +3927,412 @@ class App(tk.Tk if _tkinterdnd is None else _tkinterdnd[1].Tk):
             r1.dnd_bind("<<Drop>>", on_drop_baseline)
             r2.drop_target_register(DND_FILES)
             r2.dnd_bind("<<Drop>>", on_drop_proposed)
+            def on_drop_baseline_model(e):
+                paths = _parse_dropped_paths(e.data)
+                if paths:
+                    self.baseline_model_path.set(paths[0])
+            def on_drop_proposed_model(e):
+                paths = _parse_dropped_paths(e.data)
+                if paths:
+                    self.proposed_model_path.set(paths[0])
+            r1m.drop_target_register(DND_FILES)
+            r1m.dnd_bind("<<Drop>>", on_drop_baseline_model)
+            r2m.drop_target_register(DND_FILES)
+            r2m.dnd_bind("<<Drop>>", on_drop_proposed_model)
 
-        r3 = ttk.Frame(grid)
-        r3.pack(fill="x", pady=6)
-        ttk.Label(r3, text="Project name", width=18).pack(side="left")
-        ttk.Entry(r3, textvariable=self.project_name).pack(side="left", fill="x", expand=True)
+        r3 = ttk.Frame(grid, style="Card.TFrame")
+        r3.pack(fill="x", pady=4)
+        ttk.Label(r3, text="Project name", width=28, anchor="w", style="Muted.TLabel").pack(side="left")
+        if self._use_ctk:
+            _ctk.CTkEntry(
+                r3, textvariable=self.project_name, corner_radius=12, height=30,
+                fg_color=self._colors["input"], border_color=self._colors["border"],
+                text_color=self._colors["text"]
+            ).pack(side="left", fill="x", expand=True)
+        else:
+            ttk.Entry(r3, textvariable=self.project_name, style="Dark.TEntry").pack(side="left", fill="x", expand=True)
 
-        r3b = ttk.Frame(grid)
-        r3b.pack(fill="x", pady=6)
-        ttk.Label(r3b, text="Standard version", width=18).pack(side="left")
+        r3b = ttk.Frame(grid, style="Card.TFrame")
+        r3b.pack(fill="x", pady=4)
+        ttk.Label(r3b, text="Standard version", width=28, anchor="w", style="Muted.TLabel").pack(side="left")
         self.standard_version = tk.StringVar()
-        ttk.Entry(r3b, textvariable=self.standard_version).pack(side="left", fill="x", expand=True)
-        ttk.Label(r3b, text="(e.g. 90.1-2019, 90.1-2022 – optional)", foreground="#666").pack(side="left", padx=(8, 0))
+        if self._use_ctk:
+            _ctk.CTkEntry(
+                r3b, textvariable=self.standard_version, corner_radius=12, height=30,
+                fg_color=self._colors["input"], border_color=self._colors["border"],
+                text_color=self._colors["text"]
+            ).pack(side="left", fill="x", expand=True)
+        else:
+            ttk.Entry(r3b, textvariable=self.standard_version, style="Dark.TEntry").pack(side="left", fill="x", expand=True)
+        ttk.Label(r3b, text="(e.g. 90.1-2019 - optional)", style="Muted.TLabel").pack(side="left", padx=(8, 0))
 
-        r4 = ttk.Frame(grid)
-        r4.pack(fill="x", pady=6)
-        ttk.Label(r4, text="Units", width=18).pack(side="left")
+        r4 = ttk.Frame(grid, style="Card.TFrame")
+        r4.pack(fill="x", pady=4)
+        ttk.Label(r4, text="Units", width=28, anchor="w", style="Muted.TLabel").pack(side="left")
         self.units_var = tk.StringVar(value="imperial")
-        ttk.Radiobutton(r4, text="US Imperial", variable=self.units_var, value="imperial").pack(side="left", padx=(0, 12))
-        ttk.Radiobutton(r4, text="Metric (SI)", variable=self.units_var, value="metric").pack(side="left")
+        units_wrap = tk.Frame(r4, bg=self._colors["panel"])
+        units_wrap.pack(side="left", padx=(2, 0))
+        self.units_btn_imp = tk.Button(
+            units_wrap, text="US Imperial", relief="flat", bd=0, padx=14, pady=7, cursor="hand2",
+            font=self.font_body, command=lambda: self._set_units_mode("imperial")
+        )
+        self.units_btn_imp.pack(side="left", padx=(0, 8))
+        self.units_btn_met = tk.Button(
+            units_wrap, text="Metric (SI)", relief="flat", bd=0, padx=14, pady=7, cursor="hand2",
+            font=self.font_body, command=lambda: self._set_units_mode("metric")
+        )
+        self.units_btn_met.pack(side="left")
+        self._set_units_mode("imperial")
+        self.units_btn_imp.bind("<Enter>", lambda e: self._on_units_hover("imperial", True))
+        self.units_btn_imp.bind("<Leave>", lambda e: self._on_units_hover("imperial", False))
+        self.units_btn_met.bind("<Enter>", lambda e: self._on_units_hover("metric", True))
+        self.units_btn_met.bind("<Leave>", lambda e: self._on_units_hover("metric", False))
 
-        btns = ttk.Frame(main)
-        btns.pack(fill="x", pady=(18,6))
-        self.gen_btn = ttk.Button(btns, text="Generate ZIP (PDFs)", command=self.generate_clicked)
+        r5 = ttk.Frame(grid, style="Card.TFrame")
+        r5.pack(fill="both", expand=True, pady=4)
+        ttk.Label(r5, text="Modeling notes (optional)", style="Muted.TLabel").pack(anchor="w")
+        notes_box = ttk.Frame(r5, style="Card.TFrame")
+        notes_box.pack(fill="both", expand=True, pady=(4, 0))
+        self.notes_text = tk.Text(
+            notes_box, wrap="word", height=8, font=self.font_mono,
+            bg=self._colors["input"], fg=self._colors["text"], insertbackground=self._colors["accent"],
+            relief="flat", bd=0, highlightthickness=1, highlightbackground=self._colors["border"], highlightcolor=self._colors["accent"]
+        )
+        self.notes_text.pack(side="left", fill="both", expand=True)
+        self._init_notes_scroll_indicator(notes_box)
+        ttk.Label(r5, text="Include assumptions, equations, and modeling logic. Generated only when non-empty.", style="Muted.TLabel").pack(anchor="w", pady=(4, 0))
+
+        btns = ttk.Frame(main, style="Card.TFrame")
+        btns.pack(fill="x", pady=(12,6))
+        if self._use_ctk:
+            self.gen_btn = _ctk.CTkButton(
+                btns, text="Generate ZIP (PDFs)", command=self.generate_clicked, corner_radius=14, height=34,
+                fg_color=self._colors["accent"], hover_color="#67e8f9", text_color="#001018",
+                font=(self.font_title[0], 11, "bold")
+            )
+        else:
+            self.gen_btn = tk.Button(
+                btns, text="Generate ZIP (PDFs)", command=self.generate_clicked,
+                bg=self._colors["accent"], fg="#001018", activebackground="#67e8f9", activeforeground="#001018",
+                relief="flat", bd=0, padx=16, pady=9, cursor="hand2", font=(self.font_title[0], 10, "bold")
+            )
         self.gen_btn.pack(side="left")
-        self.open_btn = ttk.Button(btns, text="Show ZIP…", command=self.show_zip, state="disabled")
+        if self._use_ctk:
+            self.open_btn = _ctk.CTkButton(
+                btns, text="Show ZIP...", command=self.show_zip, state="disabled", corner_radius=14, height=34,
+                fg_color=self._colors["button"], hover_color=self._colors["button_hover"], text_color=self._colors["text"],
+                font=self.font_body
+            )
+        else:
+            self.open_btn = tk.Button(
+                btns, text="Show ZIP...", command=self.show_zip, state="disabled",
+                bg=self._colors["button"], fg=self._colors["text"], activebackground=self._colors["button_hover"],
+                activeforeground=self._colors["text"], disabledforeground="#64748b",
+                relief="flat", bd=0, padx=12, pady=9, cursor="hand2", font=self.font_body
+            )
         self.open_btn.pack(side="left", padx=8)
-        self.copy_btn = ttk.Button(btns, text="Copy path", command=self.copy_zip_path, state="disabled")
+        if self._use_ctk:
+            self.copy_btn = _ctk.CTkButton(
+                btns, text="Copy path", command=self.copy_zip_path, state="disabled", corner_radius=14, height=34,
+                fg_color=self._colors["button"], hover_color=self._colors["button_hover"], text_color=self._colors["text"],
+                font=self.font_body
+            )
+        else:
+            self.copy_btn = tk.Button(
+                btns, text="Copy path", command=self.copy_zip_path, state="disabled",
+                bg=self._colors["button"], fg=self._colors["text"], activebackground=self._colors["button_hover"],
+                activeforeground=self._colors["text"], disabledforeground="#64748b",
+                relief="flat", bd=0, padx=12, pady=9, cursor="hand2", font=self.font_body
+            )
         self.copy_btn.pack(side="left", padx=4)
+        if not self._use_ctk:
+            self._hover_anim_bind(self.gen_btn, self._colors["accent"], "#67e8f9")
+            self._hover_anim_bind(self.open_btn, self._colors["button"], self._colors["button_hover"])
+            self._hover_anim_bind(self.copy_btn, self._colors["button"], self._colors["button_hover"])
+            self._hover_anim_bind(self.help_btn, self._colors["button"], self._colors["button_hover"])
 
-        self.progress_frame = ttk.Frame(main)
-        self.progress_bar = ttk.Progressbar(self.progress_frame, mode="determinate", maximum=100)
+        self.progress_frame = ttk.Frame(main, style="Card.TFrame")
+        self.progress_bar = ttk.Progressbar(self.progress_frame, mode="determinate", maximum=100, style="Modern.Horizontal.TProgressbar")
         self.progress_bar.pack(fill="x")
         self.progress_frame.pack_forget()  # hidden until generation starts
 
-        self.status_label = ttk.Label(main, textvariable=self.status, foreground="#333")
-        self.status_label.pack(anchor="w", pady=(8,0))
+        self.status_label = tk.Label(
+            main, textvariable=self.status, bg=self._colors["panel"], fg=self._colors["accent_soft"],
+            font=self.font_mono, anchor="w"
+        )
+        self.status_label.pack(anchor="w", pady=(8,0), fill="x")
 
-        ttk.Label(main, text="by LIBER Creative", font=("Segoe UI", 9), foreground="#888").pack(anchor="e", pady=(12,0))
+        ttk.Label(main, text="by LIBER Creative", style="Muted.TLabel").pack(anchor="e", pady=(12,0))
+
+        self.after(120, self._animate_window_in)
+        self.after(220, self._animate_header_typewriter)
+        self.after(400, self._pulse_status_label)
+
+    def _setup_theme_and_fonts(self):
+        """Configure a modern dark UI theme and font fallbacks."""
+        self._colors = {
+            "bg": "#0b1220",
+            "panel": "#111827",
+            "text": "#e5e7eb",
+            "muted": "#94a3b8",
+            "accent": "#22d3ee",
+            "accent_soft": "#67e8f9",
+            "input": "#0f172a",
+            "border": "#334155",
+            "button": "#1f2937",
+            "button_hover": "#374151",
+        }
+        families = set(tkfont.families())
+        ui_family = "Montserrat" if "Montserrat" in families else ("Segoe UI" if "Segoe UI" in families else "Arial")
+        mono_family = "Courier New" if "Courier New" in families else ("Consolas" if "Consolas" in families else "Courier")
+        self.font_title = (ui_family, 14, "bold")
+        self.font_body = (ui_family, 10)
+        self.font_mono = (mono_family, 10)
+
+        style = ttk.Style(self)
+        try:
+            style.theme_use("clam")
+        except Exception:
+            pass
+        style.configure(".", background=self._colors["panel"], foreground=self._colors["text"], font=self.font_body)
+        style.configure("Card.TFrame", background=self._colors["panel"])
+        style.configure("TLabel", background=self._colors["panel"], foreground=self._colors["text"], font=self.font_body)
+        style.configure("Muted.TLabel", background=self._colors["panel"], foreground=self._colors["muted"], font=self.font_body)
+        style.configure("Dark.TEntry",
+                        fieldbackground=self._colors["input"], foreground=self._colors["text"], padding=6)
+        style.map("Dark.TEntry", fieldbackground=[("disabled", "#0b1220")], foreground=[("disabled", "#64748b")])
+        style.configure("Dark.TRadiobutton", background=self._colors["panel"], foreground=self._colors["text"])
+        style.map("Dark.TRadiobutton",
+                  background=[("active", self._colors["panel"])],
+                  foreground=[("active", self._colors["accent_soft"])])
+        style.configure("Accent.TButton",
+                        background=self._colors["accent"], foreground="#001018",
+                        padding=(12, 8), font=(ui_family, 10, "bold"))
+        style.map("Accent.TButton",
+                  background=[("active", "#67e8f9"), ("disabled", "#155e75")],
+                  foreground=[("disabled", "#94a3b8")])
+        style.configure("Secondary.TButton",
+                        background=self._colors["button"], foreground=self._colors["text"],
+                        padding=(10, 8), font=self.font_body)
+        style.map("Secondary.TButton",
+                  background=[("active", self._colors["button_hover"]), ("disabled", "#1e293b")],
+                  foreground=[("disabled", "#64748b")])
+        style.configure("Modern.Horizontal.TProgressbar",
+                        troughcolor=self._colors["input"],
+                        background=self._colors["accent"])
+
+    def _show_quick_help(self):
+        msg = (
+            "Quick Help\n\n"
+            "1) Select Baseline and Proposed eplustbl.html files.\n"
+            "2) (Optional) Add Baseline/Proposed model files (.osm/.idf/.imf/.txt) for schedule charts.\n"
+            "3) (Optional) Enter Modeling Notes.\n"
+            "4) Click 'Generate ZIP (PDFs)'.\n\n"
+            "Release download:\n"
+            "- Open this project's GitHub page -> Releases.\n"
+            "- Download the latest EXE from Assets.\n"
+            "- Run the EXE (or verify SHA256 first if hash is provided).\n\n"
+            "Note: schedules are model-driven when model files are provided."
+        )
+        messagebox.showinfo("How to Use", msg)
+
+    def _hex_to_rgb(self, color_hex: str):
+        c = (color_hex or "").lstrip("#")
+        return int(c[0:2], 16), int(c[2:4], 16), int(c[4:6], 16)
+
+    def _rgb_to_hex(self, rgb):
+        return "#%02x%02x%02x" % tuple(max(0, min(255, int(v))) for v in rgb)
+
+    def _blend_hex(self, from_hex: str, to_hex: str, t: float) -> str:
+        fr, fg, fb = self._hex_to_rgb(from_hex)
+        tr, tg, tb = self._hex_to_rgb(to_hex)
+        return self._rgb_to_hex((fr + (tr - fr) * t, fg + (tg - fg) * t, fb + (tb - fb) * t))
+
+    def _hover_anim_bind(self, widget, base_color: str, hover_color: str):
+        def animate(to_hover=True, step=0, steps=6):
+            t = step / steps
+            if not to_hover:
+                t = 1 - t
+            c = self._blend_hex(base_color, hover_color, t)
+            try:
+                widget.configure(bg=c, activebackground=c)
+            except Exception:
+                return
+            if step < steps:
+                self.after(16, lambda: animate(to_hover, step + 1, steps))
+        widget.bind("<Enter>", lambda e: animate(True))
+        widget.bind("<Leave>", lambda e: animate(False))
+
+    def _animate_widget_bg(self, widget, from_color: str, to_color: str, step=0, steps=6):
+        t = step / steps
+        c = self._blend_hex(from_color, to_color, t)
+        try:
+            widget.configure(bg=c, activebackground=c)
+        except Exception:
+            return
+        if step < steps:
+            self.after(16, lambda: self._animate_widget_bg(widget, from_color, to_color, step + 1, steps))
+
+    def _set_units_mode(self, mode: str):
+        self.units_var.set(mode)
+        active_bg = self._colors["accent"]
+        active_fg = "#001018"
+        idle_bg = self._colors["button"]
+        idle_fg = self._colors["text"]
+        for btn, value in ((self.units_btn_imp, "imperial"), (self.units_btn_met, "metric")):
+            is_active = (mode == value)
+            btn.configure(
+                bg=(active_bg if is_active else idle_bg),
+                fg=(active_fg if is_active else idle_fg),
+                activebackground=(active_bg if is_active else self._colors["button_hover"]),
+                activeforeground=(active_fg if is_active else idle_fg),
+            )
+
+    def _on_units_hover(self, mode: str, entering: bool):
+        """Hover animation for units switcher without breaking active selection highlight."""
+        current = self.units_var.get()
+        btn = self.units_btn_imp if mode == "imperial" else self.units_btn_met
+        if mode == current:
+            # Active option stays highlighted.
+            self._set_units_mode(current)
+            return
+        if entering:
+            self._animate_widget_bg(btn, self._colors["button"], self._colors["button_hover"])
+        else:
+            self._animate_widget_bg(btn, self._colors["button_hover"], self._colors["button"])
+            self.after(110, lambda: self._set_units_mode(current))
+
+    def _init_notes_scroll_indicator(self, parent):
+        """Create a thin auto-fading scroll indicator for notes text."""
+        self.notes_indicator_canvas = tk.Canvas(
+            parent, width=4, highlightthickness=0, bd=0,
+            bg=self._colors["input"]
+        )
+        self.notes_indicator_canvas.pack(side="right", fill="y", padx=(3, 1))
+        self.notes_indicator_line = self.notes_indicator_canvas.create_rectangle(
+            1, 1, 3, 30, fill=self._colors["accent"], outline=self._colors["accent"]
+        )
+        self.notes_indicator_level = 0.0
+        self.notes_indicator_fade_job = None
+
+        self.notes_text.configure(yscrollcommand=self._on_notes_text_scroll)
+        self.notes_text.bind("<MouseWheel>", self._on_notes_user_scroll, add="+")
+        self.notes_text.bind("<Button-4>", self._on_notes_user_scroll, add="+")
+        self.notes_text.bind("<Button-5>", self._on_notes_user_scroll, add="+")
+        self.notes_text.bind("<KeyRelease-Up>", self._on_notes_user_scroll, add="+")
+        self.notes_text.bind("<KeyRelease-Down>", self._on_notes_user_scroll, add="+")
+        self.notes_text.bind("<KeyRelease-Prior>", self._on_notes_user_scroll, add="+")
+        self.notes_text.bind("<KeyRelease-Next>", self._on_notes_user_scroll, add="+")
+        self.notes_text.bind("<Configure>", self._on_notes_user_scroll, add="+")
+        self.notes_indicator_canvas.bind("<Configure>", self._on_notes_user_scroll, add="+")
+        self._on_notes_text_scroll("0.0", "1.0")
+        self._set_notes_indicator_level(0.0)
+
+    def _on_notes_user_scroll(self, _event=None):
+        self._flash_notes_indicator()
+
+    def _on_notes_text_scroll(self, first, last):
+        """Update indicator geometry whenever notes yview changes."""
+        self._update_notes_indicator_geometry(first, last)
+
+    def _update_notes_indicator_geometry(self, first, last):
+        try:
+            f = float(first)
+            l = float(last)
+        except Exception:
+            f, l = 0.0, 1.0
+        h = max(8, int(self.notes_indicator_canvas.winfo_height()))
+        y1 = int(f * h)
+        y2 = int(max(y1 + 14, l * h))
+        y2 = min(h - 1, y2)
+        self.notes_indicator_canvas.coords(self.notes_indicator_line, 1, y1, 3, y2)
+
+    def _set_notes_indicator_level(self, level: float):
+        level = max(0.0, min(1.0, level))
+        self.notes_indicator_level = level
+        c = self._blend_hex(self._colors["input"], self._colors["accent"], level)
+        state = "hidden" if level <= 0.02 else "normal"
+        self.notes_indicator_canvas.itemconfigure(
+            self.notes_indicator_line, fill=c, outline=c, state=state
+        )
+
+    def _flash_notes_indicator(self):
+        self._set_notes_indicator_level(1.0)
+        if self.notes_indicator_fade_job:
+            try:
+                self.after_cancel(self.notes_indicator_fade_job)
+            except Exception:
+                pass
+        self.notes_indicator_fade_job = self.after(220, self._fade_notes_indicator_step)
+
+    def _fade_notes_indicator_step(self):
+        nxt = self.notes_indicator_level - 0.12
+        self._set_notes_indicator_level(nxt)
+        if nxt > 0.02:
+            self.notes_indicator_fade_job = self.after(34, self._fade_notes_indicator_step)
+        else:
+            self.notes_indicator_fade_job = None
+
+    def _animate_window_in(self, alpha=0.0):
+        try:
+            if alpha >= 0.99:
+                self.attributes("-alpha", 1.0)
+                return
+            self.attributes("-alpha", alpha)
+            self.after(18, lambda: self._animate_window_in(alpha + 0.07))
+        except Exception:
+            pass
+
+    def _animate_header_typewriter(self, idx=0):
+        if idx > len(self.header_text):
+            return
+        self.header_var.set(self.header_text[:idx])
+        self.after(16, lambda: self._animate_header_typewriter(idx + 1))
+
+    def _pulse_status_label(self, phase=0):
+        try:
+            colors = (self._colors["accent_soft"], self._colors["accent"], "#7dd3fc")
+            self.status_label.configure(fg=colors[phase % len(colors)])
+            self.after(850, lambda: self._pulse_status_label(phase + 1))
+        except Exception:
+            pass
+
+    def _apply_window_corner_preference(self):
+        """Request fully rounded corners on Windows 11 (not small-radius variant)."""
+        if sys.platform != "win32":
+            return
+        try:
+            import ctypes
+            DWMWA_WINDOW_CORNER_PREFERENCE = 33
+            DWMWCP_ROUND = 2
+            hwnd = ctypes.c_void_p(self.winfo_id())
+            pref = ctypes.c_int(DWMWCP_ROUND)
+            ctypes.windll.dwmapi.DwmSetWindowAttribute(
+                hwnd,
+                ctypes.c_uint(DWMWA_WINDOW_CORNER_PREFERENCE),
+                ctypes.byref(pref),
+                ctypes.sizeof(pref),
+            )
+        except Exception:
+            pass
 
     def _apply_app_icon(self):
         """Apply icon for window/taskbar in script and PyInstaller one-file modes."""
         try:
-            if sys.platform == "win32":
-                try:
-                    import ctypes
-                    ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(
-                        "LIBER.EnergyPlusReviewPackager"
-                    )
-                except Exception:
-                    pass
+            _set_windows_app_user_model_id()
             base_dir = getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(__file__)))
             candidates = [
+                # In one-file mode, icon can often be loaded directly from EXE resource.
+                sys.executable if getattr(sys, "frozen", False) else "",
                 os.path.join(base_dir, "EnergyPlusReviewPackager.ico"),
                 os.path.join(os.path.dirname(os.path.abspath(__file__)), "EnergyPlusReviewPackager.ico"),
             ]
             for icon_path in candidates:
                 if os.path.isfile(icon_path):
                     try:
-                        self.iconbitmap(icon_path)
+                        self.iconbitmap(default=icon_path)
+                        # Re-apply on idle for some Windows shells/taskbar refresh timing.
+                        self.after(0, lambda p=icon_path: self.iconbitmap(default=p))
                         break
                     except Exception:
                         continue
@@ -3316,6 +4348,16 @@ class App(tk.Tk if _tkinterdnd is None else _tkinterdnd[1].Tk):
         p = filedialog.askopenfilename(filetypes=[("HTML files","*.html;*.htm"),("All files","*.*")])
         if p:
             self.proposed_path.set(p)
+
+    def pick_baseline_model(self):
+        p = filedialog.askopenfilename(filetypes=[("Model files","*.idf;*.imf;*.osm;*.txt"),("All files","*.*")])
+        if p:
+            self.baseline_model_path.set(p)
+
+    def pick_proposed_model(self):
+        p = filedialog.askopenfilename(filetypes=[("Model files","*.idf;*.imf;*.osm;*.txt"),("All files","*.*")])
+        if p:
+            self.proposed_model_path.set(p)
 
     def generate_clicked(self):
         base = self.baseline_path.get().strip()
@@ -3358,7 +4400,14 @@ class App(tk.Tk if _tkinterdnd is None else _tkinterdnd[1].Tk):
                 with tempfile.TemporaryDirectory() as td:
                     outdir = os.path.join(td, "out")
                     std = self.standard_version.get().strip()
-                    zip_path = generate_package(base, prop, outdir, proj, use_imperial=use_imperial, progress_callback=on_progress, standard_version=std)
+                    notes = self.notes_text.get("1.0", "end-1c")
+                    bmodel = self.baseline_model_path.get().strip()
+                    pmodel = self.proposed_model_path.get().strip()
+                    zip_path = generate_package(
+                        base, prop, outdir, proj, use_imperial=use_imperial,
+                        progress_callback=on_progress, standard_version=std, modeling_notes=notes,
+                        baseline_model_file=bmodel, proposed_model_file=pmodel
+                    )
                     # copy to user-selected location
                     with open(zip_path, "rb") as fsrc, open(save_to, "wb") as fdst:
                         fdst.write(fsrc.read())
@@ -3435,6 +4484,7 @@ class App(tk.Tk if _tkinterdnd is None else _tkinterdnd[1].Tk):
 
 if __name__ == "__main__":
     import sys
+    _set_windows_app_user_model_id()
     if sys.platform == "win32":
         try:
             import ctypes

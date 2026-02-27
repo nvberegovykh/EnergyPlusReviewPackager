@@ -1,0 +1,62 @@
+EnergyPlus Review Packager - EXE Release Instructions
+=====================================================
+
+For End Users (Download and Run EXE)
+------------------------------------
+1) Go to this repository on GitHub.
+2) Open the Releases page.
+3) Download the latest EXE from the release Assets.
+4) (If provided) also download the .sha256 file.
+5) Run the EXE.
+
+Optional hash verification (PowerShell):
+Get-FileHash ".\EnergyPlusReviewPackager.exe" -Algorithm SHA256
+
+Compare the output hash with the value in the release .sha256 file.
+
+
+In-App Quick Usage
+------------------
+1) Select Baseline eplustbl.html.
+2) Select Proposed eplustbl.html.
+3) (Optional) Select Baseline model (.osm/.idf/.imf/.txt).
+4) (Optional) Select Proposed model (.osm/.idf/.imf/.txt).
+5) (Optional) Add Modeling Notes.
+6) Click Generate ZIP (PDFs).
+
+Help popup:
+- Click the small "?" button in the app header for built-in quick instructions.
+
+
+Outputs
+-------
+- Baseline Reports PDF
+- Proposed Reports PDF
+- Document Index PDF
+- HVAC/Envelope/Lighting subset PDFs
+- Modeling Notes PDF (only if notes were entered)
+- Final ZIP package with all generated PDFs
+
+
+Schedule Chart Notes
+--------------------
+- When model files are provided, schedule charts are model-driven.
+- Parser supports Ruleset/Day/Constant schedules and type limits.
+- Daily profiles prefer default day schedules.
+- Constants are included when they are actually referenced.
+- Charts use step-style plotting for hourly behavior.
+
+
+Publisher / Signing Note
+------------------------
+- A self-signed certificate can sign the EXE, but Windows may still show "Unknown Publisher".
+- For trusted publisher reputation across user machines, use a publicly trusted OV/EV code-signing certificate.
+
+
+For Developers (Local Build)
+----------------------------
+Build one-file EXE:
+py -3 -m PyInstaller --onefile --windowed --icon "EnergyPlusReviewPackager.ico" EnergyPlusReviewPackager.py
+
+Output folder:
+- dist\
