@@ -6,7 +6,7 @@ EnergyPlus eplustbl.html -> ZIP of reviewer-friendly PDFs (GUI, no browser).
 This is meant to be packaged as a Windows EXE via PyInstaller.
 """
 from __future__ import annotations
-import os, queue, subprocess, tempfile, threading
+import os, queue, subprocess, tempfile, threading, sys
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 
@@ -3175,7 +3175,8 @@ class App(tk.Tk if _tkinterdnd is None else _tkinterdnd[1].Tk):
     def __init__(self):
         super().__init__()
         self.title("EnergyPlus → ZIP of PDF Reports")
-        self.geometry("780x380")
+        self._apply_app_icon()
+        self.geometry("820x520")
         self.resizable(False, False)
 
         self.baseline_path = tk.StringVar()
@@ -3279,6 +3280,32 @@ class App(tk.Tk if _tkinterdnd is None else _tkinterdnd[1].Tk):
         self.status_label.pack(anchor="w", pady=(8,0))
 
         ttk.Label(main, text="by LIBER Creative", font=("Segoe UI", 9), foreground="#888").pack(anchor="e", pady=(12,0))
+
+    def _apply_app_icon(self):
+        """Apply icon for window/taskbar in script and PyInstaller one-file modes."""
+        try:
+            if sys.platform == "win32":
+                try:
+                    import ctypes
+                    ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(
+                        "LIBER.EnergyPlusReviewPackager"
+                    )
+                except Exception:
+                    pass
+            base_dir = getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(__file__)))
+            candidates = [
+                os.path.join(base_dir, "EnergyPlusReviewPackager.ico"),
+                os.path.join(os.path.dirname(os.path.abspath(__file__)), "EnergyPlusReviewPackager.ico"),
+            ]
+            for icon_path in candidates:
+                if os.path.isfile(icon_path):
+                    try:
+                        self.iconbitmap(icon_path)
+                        break
+                    except Exception:
+                        continue
+        except Exception:
+            pass
 
     def pick_baseline(self):
         p = filedialog.askopenfilename(filetypes=[("HTML files","*.html;*.htm"),("All files","*.*")])
