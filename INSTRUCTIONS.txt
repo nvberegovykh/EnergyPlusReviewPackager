@@ -1,62 +1,69 @@
-EnergyPlus Review Packager - EXE Release Instructions
-=====================================================
+EnergyPlus Review Packager v1.03
+================================
 
-For End Users (Download and Run EXE)
-------------------------------------
-1) Go to this repository on GitHub.
-2) Open the Releases page.
-3) Download the latest EXE from the release Assets.
-4) (If provided) also download the .sha256 file.
-5) Run the EXE.
+Quick start
+-----------
+1. Put each EnergyPlus report beside its matching model input:
+   - eplustbl.htm or eplustbl.html
+   - in.idf (recommended for complete daily schedules)
+2. Run EnergyPlusReviewPackager_v1.03.exe.
+3. Select the Baseline and Proposed HTML reports.
+4. The app automatically finds a nearby in.idf when available. You can also
+   select a model manually.
+5. Click Generate ZIP (PDFs).
 
-Optional hash verification (PowerShell):
-Get-FileHash ".\EnergyPlusReviewPackager.exe" -Algorithm SHA256
+Windows launcher requirements
+-----------------------------
+- EnergyPlusReviewPackager_v1.03.exe is a Windows GUI launcher.
+- It requires Python 3.10 or newer on the Windows computer.
+- On first run, it installs the required BeautifulSoup and ReportLab packages
+  for the current Windows user if they are missing.
+- The original v1.02 standalone EXE remains in dist as an archived release.
 
-Compare the output hash with the value in the release .sha256 file.
+To produce a fully self-contained Windows executable, run BUILD_v1.03.bat on
+a Windows computer. The included PyInstaller spec embeds the application icon.
 
+Schedule profiles
+-----------------
+- A daily schedule chart is created only from a complete 24-hour profile.
+- Two-point HTML summary samples (for example 11 a.m. and 11 p.m.) are never
+  stretched or mislabeled as a full daily schedule.
+- When in.idf is present, the packager resolves referenced Schedule:Year,
+  Schedule:Week:Daily, Schedule:Day:Interval, Schedule:Compact,
+  Schedule:Constant, and ScheduleTypeLimits objects.
+- Only schedules actually referenced by loads, HVAC, thermostats, controls, or
+  water-use objects are charted.
+- Temperature schedules are converted to Fahrenheit for imperial reports.
+- If complete model data is unavailable, the report says so instead of
+  inventing values.
 
-In-App Quick Usage
-------------------
-1) Select Baseline eplustbl.html.
-2) Select Proposed eplustbl.html.
-3) (Optional) Select Baseline model (.osm/.idf/.imf/.txt).
-4) (Optional) Select Proposed model (.osm/.idf/.imf/.txt).
-5) (Optional) Add Modeling Notes.
-6) Click Generate ZIP (PDFs).
-
-Help popup:
-- Click the small "?" button in the app header for built-in quick instructions.
-
+Local AI is intentionally not used to generate or modify schedule values.
+Schedule extraction is deterministic because EnergyPlus input objects are the
+authoritative source. AI can be added later for explanatory narrative only.
 
 Outputs
 -------
 - Baseline Reports PDF
 - Proposed Reports PDF
 - Document Index PDF
-- HVAC/Envelope/Lighting subset PDFs
-- Modeling Notes PDF (only if notes were entered)
-- Final ZIP package with all generated PDFs
+- HVAC, envelope, and lighting subset PDFs
+- Modeling Notes PDF when notes are supplied
+- Final ZIP package containing the generated PDFs
 
+Verification
+------------
+Run the included regression tests from the source folder:
 
-Schedule Chart Notes
---------------------
-- When model files are provided, schedule charts are model-driven.
-- Parser supports Ruleset/Day/Constant schedules and type limits.
-- Daily profiles prefer default day schedules.
-- Constants are included when they are actually referenced.
-- Charts use step-style plotting for hourly behavior.
+    python -m unittest -v test_schedule_profiles.py
 
+Verify release files with SHA256SUMS_v1.03.txt:
 
-Publisher / Signing Note
-------------------------
-- A self-signed certificate can sign the EXE, but Windows may still show "Unknown Publisher".
-- For trusted publisher reputation across user machines, use a publicly trusted OV/EV code-signing certificate.
+    Get-FileHash ".\EnergyPlusReviewPackager_v1.03.exe" -Algorithm SHA256
 
+The value should match the EXE entry in SHA256SUMS_v1.03.txt.
 
-For Developers (Local Build)
-----------------------------
-Build one-file EXE:
-py -3 -m PyInstaller --onefile --windowed --icon "EnergyPlusReviewPackager.ico" EnergyPlusReviewPackager.py
-
-Output folder:
-- dist\
+Code signing
+------------
+The release includes the icon and Windows application metadata. A trusted
+publisher name still requires signing the final EXE with an OV or EV
+code-signing certificate.

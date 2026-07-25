@@ -14,7 +14,7 @@ from tkinter import font as tkfont
 # ---- generator (embedded, simplified import-less) ----
 import re, zipfile, html as _html
 from bs4 import BeautifulSoup
-from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, PageBreak, Flowable, Preformatted
+from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, PageBreak, Flowable, Preformatted, KeepTogether
 from reportlab.lib.pagesizes import landscape, letter
 from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
 from reportlab.lib import colors
@@ -633,6 +633,18 @@ def _model_field_token(line: str) -> str:
     base = base.rstrip(";").strip()
     return norm(base)
 
+def _iter_idf_object_blocks(model_text: str):
+    """Yield complete IDF objects while retaining comments on semicolon lines."""
+    current = []
+    for line in (model_text or "").splitlines():
+        current.append(line)
+        code_only = re.sub(r"!.*$", "", line)
+        if ";" in code_only:
+            block = "\n".join(current).strip()
+            if block:
+                yield block
+            current = []
+
 def extract_used_schedule_names(soup):
     """Collect schedule names referenced in eplustbl schedule-name columns."""
     out = set()
@@ -667,8 +679,31 @@ def extract_used_schedule_refs_from_model(model_path: str):
     if not model_path or not os.path.isfile(model_path):
         return refs
     try:
-        txt = open(model_path, "r", encoding="utf-8", errors="ignore").read()
+        with open(model_path, "r", encoding="utf-8", errors="ignore") as handle:
+            txt = handle.read()
     except Exception:
+        return refs
+    if not model_path.lower().endswith(".osm"):
+        # IDF references are named fields. Ignore Schedule:* definition objects
+        # themselves so their internal day/week links do not flood the report
+        # with duplicate design-day and helper schedules.
+        for block in _iter_idf_object_blocks(txt):
+            raw_lines = [line.rstrip() for line in block.splitlines() if line.strip()]
+            tokens = _idf_object_tokens(block)
+            if not tokens:
+                continue
+            obj_type = tokens[0].lower()
+            if obj_type.startswith("schedule:") or obj_type == "scheduletypelimits":
+                continue
+            for line in raw_lines[1:]:
+                if "!-" not in line:
+                    continue
+                comment = line.split("!-", 1)[1].lower()
+                if "schedule name" not in comment:
+                    continue
+                token = _model_field_token(line)
+                if token and token not in ("-", "N/A", "NA"):
+                    refs["names"].add(token)
         return refs
     for blk in re.split(r"(?mi)^\s*(?=OS:)", txt or ""):
         if not blk or not blk.strip():
@@ -922,12 +957,196 @@ def _extract_osm_schedule_profiles(model_text: str, used_schedule_names=None, us
                 break
     return out
 
+def _idf_object_tokens(block: str):
+    """Return comment-free EnergyPlus object fields from one semicolon block."""
+    cleaned_lines = [re.sub(r"!.*$", "", line) for line in (block or "").splitlines()]
+    cleaned = "\n".join(cleaned_lines).strip()
+    if not cleaned:
+        return []
+    return [norm(token) for token in re.split(r"[,;]", cleaned) if norm(token)]
+
+def _parse_idf_compact_groups(tokens):
+    """Return [(period/day label, until-value pairs)] for Schedule:Compact."""
+    groups = []
+    through = ""
+    day_group = ""
+    pairs = []
+
+    def finish():
+        nonlocal pairs
+        if pairs:
+            label_parts = [part for part in (through, day_group) if part]
+            groups.append((" / ".join(label_parts), pairs))
+            pairs = []
+
+    i = 3
+    while i < len(tokens):
+        token = norm(tokens[i])
+        low = token.lower()
+        if low.startswith("through:"):
+            finish()
+            through = norm(token.split(":", 1)[1])
+            day_group = ""
+            i += 1
+            continue
+        if low.startswith("for:"):
+            finish()
+            day_group = norm(token.split(":", 1)[1])
+            i += 1
+            continue
+        if low.startswith("until:") and i + 1 < len(tokens):
+            time_text = norm(token.split(":", 1)[1])
+            match = re.match(r"^([0-2]?\d):([0-5]\d)$", time_text)
+            value = parse_number(tokens[i + 1])
+            if match and value is not None:
+                pairs.append((int(match.group(1)) * 60 + int(match.group(2)), float(value)))
+                i += 2
+                continue
+        i += 1
+    finish()
+    return groups
+
+def _extract_idf_schedule_profiles(model_text: str, used_schedule_names=None, max_profiles=60, model_name="in.idf"):
+    """Parse EnergyPlus Schedule:* objects into real 24-hour daily curves."""
+    used_norm = {_norm_sched_name(x) for x in (used_schedule_names or set()) if norm(x)}
+    type_limits = {}
+    days = {}
+    weeks = {}
+    years = []
+    constants = []
+    compacts = []
+
+    for raw_block in _iter_idf_object_blocks(model_text):
+        tokens = _idf_object_tokens(raw_block)
+        if len(tokens) < 2:
+            continue
+        obj_type = tokens[0].lower()
+        name = tokens[1]
+        if obj_type == "scheduletypelimits":
+            # Unit Type is the final optional field. The type-limit name itself
+            # is a useful fallback for Temperature/Fraction/OnOff schedules.
+            unit_type = tokens[5] if len(tokens) > 5 else name
+            type_limits[_norm_sched_name(name)] = unit_type or name
+        elif obj_type == "schedule:day:interval" and len(tokens) >= 5:
+            type_name = tokens[2]
+            pairs = []
+            for i in range(4, len(tokens) - 1, 2):
+                match = re.match(r"^([0-2]?\d):([0-5]\d)$", tokens[i])
+                value = parse_number(tokens[i + 1])
+                if match and value is not None:
+                    pairs.append((int(match.group(1)) * 60 + int(match.group(2)), float(value)))
+            vals = _build_hourly_from_until_pairs(pairs)
+            if len(vals) == 24:
+                days[_norm_sched_name(name)] = {
+                    "name": name,
+                    "vals": vals,
+                    "type": type_name,
+                }
+        elif obj_type == "schedule:week:daily" and len(tokens) >= 4:
+            # First seven references are Sunday through Saturday.
+            weeks[_norm_sched_name(name)] = tokens[2:9]
+        elif obj_type == "schedule:year" and len(tokens) >= 4:
+            years.append({
+                "name": name,
+                "type": tokens[2],
+                "week": tokens[3],
+            })
+        elif obj_type == "schedule:constant" and len(tokens) >= 4:
+            value = parse_number(tokens[3])
+            if value is not None:
+                constants.append({"name": name, "type": tokens[2], "value": float(value)})
+        elif obj_type == "schedule:compact" and len(tokens) >= 4:
+            compacts.append({
+                "name": name,
+                "type": tokens[2],
+                "groups": _parse_idf_compact_groups(tokens),
+            })
+
+    out = []
+    seen = set()
+
+    def add_profile(name, vals, type_name, source):
+        if not vals or len(vals) != 24:
+            return
+        unit_type = type_limits.get(_norm_sched_name(type_name), type_name)
+        vals2, unit_lbl = _convert_schedule_values_by_unit(vals, unit_type)
+        key = (_norm_sched_name(name), tuple(round(v, 6) for v in vals2))
+        if key in seen:
+            return
+        seen.add(key)
+        out.append({
+            "name": name,
+            "vals": vals2,
+            "xlabels": [str(i) for i in range(1, 25)],
+            "source": f"{source} ({os.path.basename(model_name)})",
+            "unit": unit_lbl,
+        })
+
+    # Top-level Schedule:Year objects are the names referenced by loads/HVAC.
+    for year in years:
+        if used_norm and _norm_sched_name(year["name"]) not in used_norm:
+            continue
+        day_refs = weeks.get(_norm_sched_name(year["week"]), [])
+        unique_refs = []
+        for ref in day_refs:
+            ref_norm = _norm_sched_name(ref)
+            if ref_norm and ref_norm not in unique_refs:
+                unique_refs.append(ref_norm)
+        for ref_norm in unique_refs:
+            day = days.get(ref_norm)
+            if not day:
+                continue
+            profile_name = year["name"]
+            if len(unique_refs) > 1:
+                profile_name = f"{year['name']} - {day['name']}"
+            add_profile(
+                profile_name, day["vals"], year["type"],
+                "Schedule:Year → Schedule:Day:Interval",
+            )
+            if max_profiles and len(out) >= max_profiles:
+                return out
+
+    for compact in compacts:
+        if used_norm and _norm_sched_name(compact["name"]) not in used_norm:
+            continue
+        groups = compact["groups"]
+        for label, pairs in groups:
+            vals = _build_hourly_from_until_pairs(pairs)
+            profile_name = compact["name"]
+            if len(groups) > 1 and label:
+                profile_name = f"{compact['name']} - {label}"
+            add_profile(profile_name, vals, compact["type"], "Schedule:Compact")
+            if max_profiles and len(out) >= max_profiles:
+                return out
+
+    for constant in constants:
+        if used_norm and _norm_sched_name(constant["name"]) not in used_norm:
+            continue
+        add_profile(
+            constant["name"], [constant["value"]] * 24,
+            constant["type"], "Schedule:Constant",
+        )
+        if max_profiles and len(out) >= max_profiles:
+            return out
+
+    # Direct day schedules are valid model data too. Only include them when the
+    # report explicitly references the day name, or as a conservative fallback
+    # when no top-level schedule could be resolved.
+    for day_norm, day in days.items():
+        if used_norm and day_norm not in used_norm:
+            continue
+        add_profile(day["name"], day["vals"], day["type"], "Schedule:Day:Interval")
+        if max_profiles and len(out) >= max_profiles:
+            return out
+    return out
+
 def extract_model_schedule_profiles(model_path: str, used_schedule_names=None, used_schedule_handles=None, max_profiles=24):
-    """Extract day schedule curves from model text (.idf/.osm/other text-like) using Until: HH:MM, value pairs."""
+    """Extract complete daily schedule curves from OSM or EnergyPlus IDF text."""
     if not model_path or not os.path.isfile(model_path):
         return []
     try:
-        txt = open(model_path, "r", encoding="utf-8", errors="ignore").read()
+        with open(model_path, "r", encoding="utf-8", errors="ignore") as handle:
+            txt = handle.read()
     except Exception:
         return []
     if model_path.lower().endswith(".osm"):
@@ -936,57 +1155,77 @@ def extract_model_schedule_profiles(model_path: str, used_schedule_names=None, u
         )
         if osm_profiles:
             return osm_profiles
-    used_norm = {_norm_sched_name(x) for x in (used_schedule_names or set()) if norm(x)}
-    blocks = txt.split(";")
-    out = []
-    seen = set()
-    for b in blocks:
-        blo = b.lower()
-        if "until:" not in blo:
-            continue
-        # best-effort object + name extraction
-        lines = [re.sub(r"!.*$", "", x).strip() for x in b.splitlines()]
-        lines = [x for x in lines if x]
-        if not lines:
-            continue
-        head = lines[0]
-        # gather comma-separated cleaned tokens
-        tokens = []
-        for ln in lines:
-            parts = [norm(p) for p in ln.split(",")]
-            tokens.extend([p for p in parts if p])
-        if len(tokens) < 2:
-            continue
-        obj_type = tokens[0]
-        sched_name = tokens[1]
-        if used_norm and _norm_sched_name(sched_name) not in used_norm:
-            # if used names were provided, keep only referenced schedules
-            continue
-        pairs = []
-        for m in re.finditer(r"Until:\s*([0-2]?\d):([0-5]\d)\s*,\s*([-+]?\d+(?:\.\d+)?)", b, flags=re.I):
-            hh = int(m.group(1)); mm = int(m.group(2)); vv = float(m.group(3))
-            pairs.append((hh * 60 + mm, vv))
-        if len(pairs) < 2:
-            continue
-        vals = _build_hourly_from_until_pairs(pairs)
-        if len(vals) != 24:
-            continue
-        key = (_norm_sched_name(sched_name), tuple(round(v, 6) for v in vals))
-        if key in seen:
-            continue
-        seen.add(key)
-        out.append({
-            "name": sched_name,
-            "vals": vals,
-            "xlabels": [str(i) for i in range(1, 25)],
-            "source": f"{obj_type} ({os.path.basename(model_path)})",
-        })
-        if max_profiles and len(out) >= max_profiles:
-            break
-    return out
+    return _extract_idf_schedule_profiles(
+        txt,
+        used_schedule_names=used_schedule_names,
+        max_profiles=max_profiles,
+        model_name=model_path,
+    )
+
+def discover_schedule_model(report_html: str, explicit_model_file: str = "") -> str:
+    """Resolve the model that supplied an EnergyPlus HTML report.
+
+    OpenStudio/EnergyPlus run folders normally keep ``in.idf`` beside
+    ``eplustbl.html``. Prefer that exact run input and only use a generic model
+    candidate when there is exactly one unambiguous file in the folder.
+    """
+    explicit = os.path.abspath(explicit_model_file) if explicit_model_file else ""
+    if explicit and os.path.isfile(explicit):
+        return explicit
+    if not report_html:
+        return ""
+    report_path = os.path.abspath(report_html)
+    report_dir = os.path.dirname(report_path)
+    if not os.path.isdir(report_dir):
+        return ""
+
+    def existing_case_insensitive(folder: str, filename: str) -> str:
+        try:
+            wanted = filename.casefold()
+            for entry in os.listdir(folder):
+                if entry.casefold() == wanted:
+                    candidate = os.path.join(folder, entry)
+                    if os.path.isfile(candidate):
+                        return candidate
+        except OSError:
+            pass
+        return ""
+
+    # First choice: the translated simulation input in the report's run folder.
+    for filename in ("in.idf", "in.imf", "in.osm"):
+        candidate = existing_case_insensitive(report_dir, filename)
+        if candidate:
+            return candidate
+
+    # Common manual-export layout: report and a single model file share a folder.
+    try:
+        model_files = [
+            os.path.join(report_dir, entry)
+            for entry in os.listdir(report_dir)
+            if os.path.isfile(os.path.join(report_dir, entry))
+            and os.path.splitext(entry)[1].casefold() in (".idf", ".imf", ".osm")
+        ]
+    except OSError:
+        model_files = []
+    if len(model_files) == 1:
+        return model_files[0]
+
+    # Some workflows place the report one level below the translated input.
+    parent_dir = os.path.dirname(report_dir)
+    if parent_dir and parent_dir != report_dir:
+        for filename in ("in.idf", "in.imf", "in.osm"):
+            candidate = existing_case_insensitive(parent_dir, filename)
+            if candidate:
+                return candidate
+    return ""
 
 def extract_schedule_profiles(soup, max_profiles=12):
-    """Extract chartable schedule series from schedule-anchor tables in eplustbl."""
+    """Extract only complete 24-hour schedule series from eplustbl tables.
+
+    EnergyPlus schedule summary tables often expose only two representative
+    values (for example 11 a.m. and 11 p.m.). Those values are useful summary
+    samples but are not a daily curve and must never be stretched over 24 hours.
+    """
     if not soup:
         return []
     candidates = []
@@ -1059,7 +1298,7 @@ def extract_schedule_profiles(soup, max_profiles=12):
                     continue
                 vals.append(float(v))
                 labels.append(norm(hdr[j]) if j < len(hdr) else f"v{j}")
-            if len(vals) < 2:
+            if len(vals) != 24:
                 continue
             disp_name = f"{name} ({descriptor})" if descriptor else name
             key = ((title or "").lower(), disp_name.lower(), tuple(round(v, 5) for v in vals))
@@ -1070,6 +1309,18 @@ def extract_schedule_profiles(soup, max_profiles=12):
             if max_profiles is not None and len(candidates) >= max_profiles:
                 return candidates
     return candidates
+
+def _is_complete_daily_schedule(profile) -> bool:
+    """Return True only for an explicit, finite 24-value daily schedule."""
+    if not isinstance(profile, dict):
+        return False
+    vals = profile.get("vals")
+    if not isinstance(vals, (list, tuple)) or len(vals) != 24:
+        return False
+    try:
+        return all(float(v) == float(v) and abs(float(v)) != float("inf") for v in vals)
+    except (TypeError, ValueError):
+        return False
 
 def extract_end_uses_fuel_gj(soup):
     """Return annual purchased energy by fuel from End Uses table, in GJ."""
@@ -1278,7 +1529,7 @@ def _draw_end_use_chart(data, width=4*inch, height=3*inch):
 
 def _draw_schedule_chart(profile, width=4.4*inch, height=2.2*inch):
     """Draw one schedule profile chart with coordinate axes and grid."""
-    if not _HAS_GRAPHICS or not profile:
+    if not _HAS_GRAPHICS or not _is_complete_daily_schedule(profile):
         return None
     vals = profile.get("vals") if isinstance(profile, dict) else None
     xlabels = profile.get("xlabels") if isinstance(profile, dict) else None
@@ -1308,7 +1559,7 @@ def _draw_schedule_chart(profile, width=4.4*inch, height=2.2*inch):
         lp.lines[0].strokeWidth = 1.8
         lp.joinedLines = 1
         lp.xValueAxis.valueMin = 1
-        lp.xValueAxis.valueMax = max(24, len(vals))
+        lp.xValueAxis.valueMax = 24
         lp.xValueAxis.valueStep = 1
         lp.xValueAxis.labels.fontName = "Helvetica"
         lp.xValueAxis.labels.fontSize = 6
@@ -3076,18 +3327,36 @@ def add_top_summary_annual(flow, soup, H2, H3, NOTE, usable_w, header_cell, body
             flow.append(chart)
             flow.append(Spacer(1, 0.15*inch))
     schedules = schedule_profiles if schedule_profiles is not None else extract_schedule_profiles(soup, max_profiles=12)
+    schedules = [profile for profile in schedules if _is_complete_daily_schedule(profile)]
     if schedules:
-        flow.append(Paragraph("Schedule Profiles (Daily)", H3))
-        flow.append(Paragraph("Hourly schedule curves (0-24h).", NOTE))
-        for profile in schedules:
+        for index, profile in enumerate(schedules):
             sch_chart = _draw_schedule_chart(profile, width=min(usable_w * 0.72, 6.9*inch), height=2.4*inch)
             if sch_chart:
-                flow.append(sch_chart)
                 # Name under each chart as requested
                 src = _html.escape(profile.get("source", "Schedules"))
                 nm = _html.escape(profile.get("name", "Schedule"))
-                flow.append(Paragraph(f"<b>{nm}</b> <font color='#64748b'>(from {src})</font>", NOTE))
-                flow.append(Spacer(1, 0.08*inch))
+                chart_group = []
+                if index == 0:
+                    chart_group.extend([
+                        Paragraph("Schedule Profiles (Daily)", H3),
+                        Paragraph("Hourly schedule curves (0-24h).", NOTE),
+                    ])
+                chart_group.extend([
+                    sch_chart,
+                    Paragraph(f"<b>{nm}</b> <font color='#64748b'>(from {src})</font>", NOTE),
+                    Spacer(1, 0.08*inch),
+                ])
+                flow.append(KeepTogether(chart_group))
+        flow.append(Spacer(1, 0.08*inch))
+    else:
+        flow.append(Paragraph("Schedule Profiles (Daily)", H3))
+        flow.append(Paragraph(
+            "No complete 24-hour schedule series was available. The report packager "
+            "does not convert the two-point schedule summaries in eplustbl.html into "
+            "hourly curves. Select the corresponding OSM/IDF model, or keep in.idf "
+            "beside eplustbl.html so it can be detected automatically.",
+            NOTE
+        ))
         flow.append(Spacer(1, 0.08*inch))
     targets = [
         ("Annual Building Utility Performance Summary", ["annual building utility", "utility performance", "site and source energy", "end uses"]),
@@ -3659,9 +3928,11 @@ def generate_package(baseline_html: str, proposed_html: str, outdir: str, projec
     prog(2, "Parsing HTML…")
     base_soup = load_soup(baseline_html)
     prop_soup = load_soup(proposed_html)
-    # If model files are provided, schedule extraction is model-driven only.
-    base_sched_names = set() if baseline_model_file else extract_used_schedule_names(base_soup)
-    prop_sched_names = set() if proposed_model_file else extract_used_schedule_names(prop_soup)
+    # Prefer explicit models, otherwise use the translated input beside eplustbl.
+    baseline_model_file = discover_schedule_model(baseline_html, baseline_model_file)
+    proposed_model_file = discover_schedule_model(proposed_html, proposed_model_file)
+    base_sched_names = extract_used_schedule_names(base_soup)
+    prop_sched_names = extract_used_schedule_names(prop_soup)
     base_refs = extract_used_schedule_refs_from_model(baseline_model_file) if baseline_model_file else {"names": set(), "handles": set()}
     prop_refs = extract_used_schedule_refs_from_model(proposed_model_file) if proposed_model_file else {"names": set(), "handles": set()}
     base_used_names = set(base_sched_names) | set(base_refs.get("names", set()))
@@ -3910,19 +4181,23 @@ class App(tk.Tk if _tkinterdnd is None else _tkinterdnd[1].Tk):
 
         r1 = row("Baseline HTML", self.baseline_path, self.pick_baseline)
         r2 = row("Proposed HTML", self.proposed_path, self.pick_proposed)
-        r1m = row("Baseline model (opt.)", self.baseline_model_path, self.pick_baseline_model)
-        r2m = row("Proposed model (opt.)", self.proposed_model_path, self.pick_proposed_model)
+        r1m = row("Baseline model (auto: in.idf)", self.baseline_model_path, self.pick_baseline_model)
+        r2m = row("Proposed model (auto: in.idf)", self.proposed_model_path, self.pick_proposed_model)
 
         if _tkinterdnd:
             DND_FILES, _ = _tkinterdnd
             def on_drop_baseline(e):
                 paths = _parse_dropped_paths(e.data)
                 if paths:
-                    self.baseline_path.set(paths[0])
+                    self._set_report_and_discover_model(
+                        self.baseline_path, self.baseline_model_path, paths[0]
+                    )
             def on_drop_proposed(e):
                 paths = _parse_dropped_paths(e.data)
                 if paths:
-                    self.proposed_path.set(paths[0])
+                    self._set_report_and_discover_model(
+                        self.proposed_path, self.proposed_model_path, paths[0]
+                    )
             r1.drop_target_register(DND_FILES)
             r1.dnd_bind("<<Drop>>", on_drop_baseline)
             r2.drop_target_register(DND_FILES)
@@ -4125,14 +4400,16 @@ class App(tk.Tk if _tkinterdnd is None else _tkinterdnd[1].Tk):
         msg = (
             "Quick Help\n\n"
             "1) Select Baseline and Proposed eplustbl.html files.\n"
-            "2) (Optional) Add Baseline/Proposed model files (.osm/.idf/.imf/.txt) for schedule charts.\n"
+            "2) The matching in.idf is detected automatically when it is beside each HTML.\n"
+            "   Otherwise select the Baseline/Proposed model files for complete schedule charts.\n"
             "3) (Optional) Enter Modeling Notes.\n"
             "4) Click 'Generate ZIP (PDFs)'.\n\n"
             "Release download:\n"
             "- Open this project's GitHub page -> Releases.\n"
             "- Download the latest EXE from Assets.\n"
             "- Run the EXE (or verify SHA256 first if hash is provided).\n\n"
-            "Note: schedules are model-driven when model files are provided."
+            "Note: only complete 24-hour model schedules are charted; two-point HTML "
+            "summary samples are never presented as daily curves."
         )
         messagebox.showinfo("How to Use", msg)
 
@@ -4324,6 +4601,7 @@ class App(tk.Tk if _tkinterdnd is None else _tkinterdnd[1].Tk):
             candidates = [
                 # In one-file mode, icon can often be loaded directly from EXE resource.
                 sys.executable if getattr(sys, "frozen", False) else "",
+                os.environ.get("ENERGYPLUS_REVIEW_PACKAGER_ICON", ""),
                 os.path.join(base_dir, "EnergyPlusReviewPackager.ico"),
                 os.path.join(os.path.dirname(os.path.abspath(__file__)), "EnergyPlusReviewPackager.ico"),
             ]
@@ -4342,12 +4620,23 @@ class App(tk.Tk if _tkinterdnd is None else _tkinterdnd[1].Tk):
     def pick_baseline(self):
         p = filedialog.askopenfilename(filetypes=[("HTML files","*.html;*.htm"),("All files","*.*")])
         if p:
-            self.baseline_path.set(p)
+            self._set_report_and_discover_model(
+                self.baseline_path, self.baseline_model_path, p
+            )
 
     def pick_proposed(self):
         p = filedialog.askopenfilename(filetypes=[("HTML files","*.html;*.htm"),("All files","*.*")])
         if p:
-            self.proposed_path.set(p)
+            self._set_report_and_discover_model(
+                self.proposed_path, self.proposed_model_path, p
+            )
+
+    def _set_report_and_discover_model(self, report_var, model_var, report_path):
+        report_var.set(report_path)
+        if not model_var.get().strip():
+            detected = discover_schedule_model(report_path)
+            if detected:
+                model_var.set(detected)
 
     def pick_baseline_model(self):
         p = filedialog.askopenfilename(filetypes=[("Model files","*.idf;*.imf;*.osm;*.txt"),("All files","*.*")])
